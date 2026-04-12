@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 public final class SSTable {
 
@@ -44,6 +45,68 @@ public final class SSTable {
                 ssTableMetadata.index,
                 ssTableMetadata.dataOffset
         );
+    }
+
+    public Optional<LSMEntry> get(String key) {
+        if(!bloomFilter.mightContain(key)) {
+            return Optional.empty();
+        }
+
+        long offset = binarySearchIndex(key);
+        if(offset < 0) {
+            return Optional.empty();
+        }
+
+        return scanFromOffset(key, offset);
+    }
+
+    private long binarySearchIndex(String key) {
+        int lo = 0;
+        int hi = indexEntries.size() - 1;
+        long closestOffset = -1;
+
+        while (lo <= hi) {
+            int mid = lo + (hi - lo) / 2;
+            int cmp = indexEntries.get(mid).key().compareTo(key);
+
+            if (cmp == 0) {
+                return indexEntries.get(mid).offset(); // exact match
+            } else if (cmp < 0) {
+                closestOffset = indexEntries.get(mid).offset(); // best candidate so far
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        return closestOffset; // scan forward from here
+    }
+
+    private Optional<LSMEntry> scanFromOffset(String key, long offset) {
+        try {
+            fileChannel.position(offset);
+            while(fileChannel.position() < fileChannel.size()) {
+                long entrySize = readInt64LE(fileChannel);
+
+                byte[] data = readBytes(fileChannel, entrySize);
+
+                LSMEntry entry = SSTableIterable.unmarshall(data);
+
+                int cmp = entry.key().compareTo(key);
+
+                if(cmp == 0) {
+                    return Optional.of(entry);
+                }
+
+                if(cmp < 0) {
+                    return Optional.empty();
+                }
+            }
+
+            return Optional.empty();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     public static SSTable write(Path directory, List<LSMEntry> entries) throws IOException {
