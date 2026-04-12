@@ -1,4 +1,6 @@
-package org.db.core;
+package org.db.utility;
+
+import org.db.core.SSTable;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;

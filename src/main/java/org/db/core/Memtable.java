@@ -1,10 +1,14 @@
 package org.db.core;
 
+import org.db.dto.Command;
+import org.db.utility.LSMEntry;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.TreeMap;
 
-import static org.db.core.Command.PUT;
+import static org.db.dto.Command.PUT;
+import static org.db.dto.Command.TOMBSTONE;
 
 public class Memtable {
 
@@ -29,6 +33,18 @@ public class Memtable {
 
         data.put(key, getLSMEntry(key, value, PUT));
         size += sizeChange;
+    }
+
+    public void delete(String key) {
+        LSMEntry existing = data.get(key);
+        if (existing != null) {
+            if(existing instanceof LSMEntry.Put(var k, var v, var t)) {
+                size -= v.length;
+            }
+        } else {
+            size += key.length();
+        }
+        data.put(key, getLSMEntry(key, null, TOMBSTONE));
     }
 
     public LSMEntry get(String key) {
@@ -57,6 +73,7 @@ public class Memtable {
         return switch (command) {
             case PUT -> new LSMEntry.Put(key, value, timestamp);
             case TOMBSTONE -> new LSMEntry.Tombstone(key, timestamp);
+            default -> throw new IllegalStateException("Unexpected value: " + command);
         };
     }
 }

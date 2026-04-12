@@ -1,5 +1,10 @@
 package org.db.core;
 
+import org.db.dto.Command;
+import org.db.dto.Levels;
+import org.db.utility.LSMEntry;
+import org.db.utility.SSTableIterable;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -42,6 +47,14 @@ public class LSMTree {
     private final BlockingQueue<Memtable> flushingChan = new LinkedBlockingQueue<>(100);
     private final ReentrantReadWriteLock flushingQueueMutex = new ReentrantReadWriteLock();
 
+    public BlockingQueue<Integer> getCompactionChan() {
+        return compactionChan;
+    }
+
+    public BlockingQueue<Memtable> getFlushingChan() {
+        return flushingChan;
+    }
+
     // Channels → bounded blocking queues
     private final BlockingQueue<Integer> compactionChan = new LinkedBlockingQueue<>(100);
 
@@ -66,6 +79,7 @@ public class LSMTree {
     }
 
     public static LSMTree open(Path directory, long maxMemtableSize, boolean recoverFromWAL) throws IOException {
+        System.out.println("Opening LSMTree with maxMemtableSize " + maxMemtableSize);
         WriteAheadLog wal = WriteAheadLog.open(
                 directory.resolve(directory.getFileName() + WAL_DIR_SUFFIX),
                 true,
@@ -85,7 +99,27 @@ public class LSMTree {
         return lsm;
     }
 
+    public void close() throws IOException {
+        closed = true;
+        executor.shutdown();
+        try {
+            executor.awaitTermination(10, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        // Close all open SSTable file handles
+        for (Levels level : levels) {
+            for (SSTable sst : level.getSsTables()) {
+                sst.close();
+            }
+        }
+
+        wal.close();
+    }
+
     public void put(String key, byte[] value) {
+        System.out.println("Putting key " + key + " with value " + value);
         this.mutex.writeLock().lock();
         try {
             if(!inRecovery) {
@@ -142,7 +176,35 @@ public class LSMTree {
          return null;
     }
 
+    public void delete(String key) {
+        System.out.println("Deleting key " + key);
+        mutex.writeLock().lock();
+
+        if(!inRecovery) {
+            wal.writeEntry(new WriteAheadLog.WALEntry(
+                    key,
+                    null,
+                    Command.TOMBSTONE,
+                    System.nanoTime()
+            ));
+        }
+
+        memtable.delete(key);
+
+        if(memtable.sizeInBytes() > maxMemtableSize) {
+            flushingQueueMutex.writeLock().lock();
+            flushingQueue.add(memtable);
+            flushingQueueMutex.writeLock().unlock();
+
+            flushingChan.offer(memtable);
+            memtable = new Memtable();
+        }
+
+        mutex.writeLock().unlock();
+    }
+
     private void loadSSTables() throws IOException {
+        System.out.println("Loading SSTables");
         Files.createDirectories(directory);
         loadSSTablesFromDisk();
         sortSSTablesBySequenceNumber();
@@ -268,7 +330,67 @@ public class LSMTree {
     }
 
     private void backgroundMemtableFlushing() {
+        try {
+            while(true) {
+                Memtable memtable = flushingChan.poll(50, TimeUnit.MILLISECONDS);
+                if(memtable != null) {
+                    flushMemtable(memtable);
+                } else if (closed) {
+                    if(flushingChan.isEmpty()) {
+                        return;
+                    }
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
 
+    public void flushMemtable (Memtable memtable) {
+        if(memtable.sizeInBytes() == 0) {
+            return;
+        }
+
+        currentSSTSequence.incrementAndGet();
+
+        Path path = getSSTableFilename(0);
+
+        SSTable sst;
+        try {
+            sst = SSTable.write(path, memtable.getEntries());
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to flush memtable to SSTable: " + path.getFileName().toString(), e);
+        }
+
+        levels[0].getMutex().writeLock().lock();
+        flushingQueueMutex.writeLock().lock();
+
+        try {
+            wal.createCheckPoint(new WriteAheadLog.WALEntry(
+                    path.getFileName().toString(),
+                    null,
+                    Command.WRITE_SST,
+                    System.nanoTime()
+            ));
+
+            levels[0].getSsTables().add(sst);
+
+            if(!flushingQueue.isEmpty()) {
+                flushingQueue.removeFirst();
+            }
+        } finally {
+            flushingQueueMutex.writeLock().unlock();
+            levels[0].getMutex().writeLock().unlock();
+        }
+
+        // Always signals compaction after a flush — no capacity check
+        // Unlike our earlier offer(), this mirrors Go's blocking send
+        // Use put() to block if queue is full, matching Go's blocking channel send
+        try {
+            compactionChan.put(0);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private SSTable mergeSSTables(List<SSTableIterable> iterators, int targetLevel) {
