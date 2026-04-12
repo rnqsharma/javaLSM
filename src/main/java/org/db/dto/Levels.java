@@ -1,4 +1,6 @@
-package org.db.core;
+package org.db.dto;
+
+import org.db.core.SSTable;
 
 import java.util.ArrayList;
 import java.util.List;

@@ -1,5 +1,10 @@
 package org.db.core;
 
+import org.db.dto.IndexEntry;
+import org.db.dto.MetadataAndBuffer;
+import org.db.utility.LSMEntry;
+import org.db.utility.SSTableIterable;
+
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -45,6 +50,10 @@ public final class SSTable {
                 ssTableMetadata.index,
                 ssTableMetadata.dataOffset
         );
+    }
+
+    public void close() throws IOException {
+        fileChannel.close();
     }
 
     public Optional<LSMEntry> get(String key) {

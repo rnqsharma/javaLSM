@@ -1,5 +1,7 @@
 package org.db.core;
 
+import org.db.dto.Command;
+
 import java.nio.file.Path;
 
 // TODO: Implement WAL
@@ -17,5 +19,13 @@ public class WriteAheadLog {
 
     public void writeEntry(WALEntry entry) {
 
+    }
+
+    public void createCheckPoint(WALEntry entry) {
+
+    }
+
+    public void close() {
+        return;
     }
 }
