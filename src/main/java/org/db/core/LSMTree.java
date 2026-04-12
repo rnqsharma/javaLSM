@@ -61,6 +61,8 @@ public class LSMTree {
 
         // Similar to goroutines
         this.executor = Executors.newVirtualThreadPerTaskExecutor();
+
+        System.out.println("Creating LSMTree with maxMemtableSize " + maxMemtableSize);
     }
 
     public static LSMTree open(Path directory, long maxMemtableSize, boolean recoverFromWAL) throws IOException {
@@ -81,6 +83,63 @@ public class LSMTree {
         lsm.executor.submit(lsm::backgroundMemtableFlushing);
 
         return lsm;
+    }
+
+    public void put(String key, byte[] value) {
+        this.mutex.writeLock().lock();
+        try {
+            if(!inRecovery) {
+                this.wal.writeEntry(new WriteAheadLog.WALEntry(key, value, Command.PUT, System.nanoTime()));
+            }
+
+            memtable.put(key, value);
+
+            if(memtable.sizeInBytes() > maxMemtableSize) {
+                flushingQueueMutex.writeLock().lock();
+                flushingQueue.add(memtable);
+                flushingQueueMutex.writeLock().unlock();
+
+                flushingChan.offer(memtable);
+                memtable = new Memtable();
+            }
+        } finally {
+            mutex.writeLock().unlock();
+        }
+    }
+
+    public byte[] get(String key) {
+        this.mutex.readLock().lock();
+         LSMEntry value = memtable.get(key);
+         if(value != null) {
+             this.mutex.readLock().unlock();
+             return handleValue(value);
+         }
+         this.mutex.readLock().unlock();
+
+         // Check flushing queue memtables in reverse order
+         flushingQueueMutex.readLock().lock();
+         for(int i=flushingQueue.size() - 1; i >= 0; i--) {
+             value = flushingQueue.get(i).get(key);
+             if(value != null) {
+                 flushingQueueMutex.readLock().unlock();
+                 return handleValue(value);
+             }
+         }
+         flushingQueueMutex.readLock().unlock();
+
+         for(Levels level : levels) {
+             level.getMutex().readLock().lock();
+
+             for (int i= level.getSsTables().size()-1; i >= 0; i--) {
+                 value = level.getSsTables().get(i).get(key).orElse(null);
+                 if(value != null) {
+                     level.getMutex().readLock().unlock();
+                     return handleValue(value);
+                 }
+             }
+             level.getMutex().readLock().unlock();
+         }
+         return null;
     }
 
     private void loadSSTables() throws IOException {
@@ -312,5 +371,12 @@ public class LSMTree {
     private void addSSTableAtLevel(SSTable mergedSSTable, int levelIdx) {
         levels[levelIdx].getSsTables().add(mergedSSTable);
         compactionChan.offer(levelIdx);
+    }
+
+    private byte[] handleValue(LSMEntry entry) {
+        if (entry instanceof LSMEntry.Tombstone) {
+            return null;
+        }
+        return ((LSMEntry.Put) entry).value();
     }
 }
