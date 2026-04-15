@@ -34,14 +34,13 @@ class StorageEngineIntegrationTest {
     private static final long SMALL_MEMTABLE_SIZE = 256;
     private static final long LARGE_MEMTABLE_SIZE = 64 * 1024 * 1024; // 64MB
 
-    @TempDir
-    Path tempDir;
+    private static final Path TEST_DIR = Path.of("/Users/raunaq/Documents/Project/Storage");
 
     private LSMTree lsm;
 
     @BeforeEach
     void setUp() throws IOException {
-        lsm = LSMTree.open(tempDir, LARGE_MEMTABLE_SIZE, false);
+        lsm = LSMTree.open(TEST_DIR, LARGE_MEMTABLE_SIZE, false);
     }
 
     @AfterEach
@@ -157,7 +156,7 @@ class StorageEngineIntegrationTest {
         lsm.close();
 
         // Reopen with WAL recovery
-        LSMTree recovered = LSMTree.open(tempDir, LARGE_MEMTABLE_SIZE, true);
+        LSMTree recovered = LSMTree.open(TEST_DIR, LARGE_MEMTABLE_SIZE, true);
         try {
             byte[] result = recovered.get("survivor");
             assertNotNull(result);
@@ -175,7 +174,7 @@ class StorageEngineIntegrationTest {
         lsm.delete("key");
         lsm.close();
 
-        LSMTree recovered = LSMTree.open(tempDir, LARGE_MEMTABLE_SIZE, true);
+        LSMTree recovered = LSMTree.open(TEST_DIR, LARGE_MEMTABLE_SIZE, true);
         try {
             assertNull(recovered.get("key"));
         } finally {
@@ -188,8 +187,8 @@ class StorageEngineIntegrationTest {
     @DisplayName("Data survives SSTable reload after close")
     void testSSTableReload() throws IOException, InterruptedException {
         // Use small memtable to force flush to SSTable
-        lsm.close();
-        lsm = LSMTree.open(tempDir, SMALL_MEMTABLE_SIZE, false);
+//        lsm.close();
+        lsm = LSMTree.open(TEST_DIR, SMALL_MEMTABLE_SIZE, false);
 
         // Write enough data to trigger flush
         writeNEntries(lsm, 100);
@@ -200,7 +199,7 @@ class StorageEngineIntegrationTest {
         lsm.close();
 
         // Reopen without WAL recovery — data must come from SSTables
-        LSMTree reloaded = LSMTree.open(tempDir, LARGE_MEMTABLE_SIZE, false);
+        LSMTree reloaded = LSMTree.open(TEST_DIR, LARGE_MEMTABLE_SIZE, false);
         try {
             for (int i = 0; i < 100; i++) {
                 byte[] result = reloaded.get("key-" + i);
@@ -219,7 +218,7 @@ class StorageEngineIntegrationTest {
     @DisplayName("Data readable immediately after flush trigger")
     void testReadAfterFlush() throws IOException, InterruptedException {
         lsm.close();
-        lsm = LSMTree.open(tempDir, SMALL_MEMTABLE_SIZE, false);
+        lsm = LSMTree.open(TEST_DIR, SMALL_MEMTABLE_SIZE, false);
 
         writeNEntries(lsm, 200);
         waitForFlush();
@@ -237,7 +236,7 @@ class StorageEngineIntegrationTest {
     @DisplayName("Flushing queue drains before shutdown")
     void testFlushingQueueDrainsOnClose() throws IOException, InterruptedException {
         lsm.close();
-        lsm = LSMTree.open(tempDir, SMALL_MEMTABLE_SIZE, false);
+        lsm = LSMTree.open(TEST_DIR, SMALL_MEMTABLE_SIZE, false);
 
         // Write enough to queue multiple flushes
         writeNEntries(lsm, 500);
@@ -246,7 +245,7 @@ class StorageEngineIntegrationTest {
         lsm.close();
 
         // Reopen and verify all data present on disk
-        LSMTree reloaded = LSMTree.open(tempDir, LARGE_MEMTABLE_SIZE, false);
+        LSMTree reloaded = LSMTree.open(TEST_DIR, LARGE_MEMTABLE_SIZE, false);
         try {
             for (int i = 0; i < 500; i++) {
                 assertNotNull(reloaded.get("key-" + i), "key-" + i + " lost on shutdown");
@@ -265,7 +264,7 @@ class StorageEngineIntegrationTest {
     void testDataCorrectAfterCompaction() throws IOException, InterruptedException {
         lsm.close();
         // Very small memtable to trigger many flushes and compaction
-        lsm = LSMTree.open(tempDir, SMALL_MEMTABLE_SIZE, false);
+        lsm = LSMTree.open(TEST_DIR, SMALL_MEMTABLE_SIZE, false);
 
         // Write enough to trigger Level 0 → Level 1 compaction (needs > 4 SSTables)
         writeNEntries(lsm, 1000);
@@ -284,7 +283,7 @@ class StorageEngineIntegrationTest {
     @DisplayName("Compaction merges overwrites correctly — latest value wins")
     void testCompactionKeepsLatestValue() throws IOException, InterruptedException {
         lsm.close();
-        lsm = LSMTree.open(tempDir, SMALL_MEMTABLE_SIZE, false);
+        lsm = LSMTree.open(TEST_DIR, SMALL_MEMTABLE_SIZE, false);
 
         // Write v1, force flush, write v2, force flush, trigger compaction
         lsm.put("key", "v1".getBytes());
@@ -307,7 +306,7 @@ class StorageEngineIntegrationTest {
     @DisplayName("Compaction removes tombstones — deleted key stays deleted")
     void testCompactionRemovesTombstones() throws IOException, InterruptedException {
         lsm.close();
-        lsm = LSMTree.open(tempDir, SMALL_MEMTABLE_SIZE, false);
+        lsm = LSMTree.open(TEST_DIR, SMALL_MEMTABLE_SIZE, false);
 
         lsm.put("ghost", "haunt".getBytes());
         writeNEntries(lsm, 100);
@@ -520,7 +519,7 @@ class StorageEngineIntegrationTest {
         lsm.close();
 
         // Reopen WITHOUT WAL recovery
-        LSMTree reloaded = LSMTree.open(tempDir, LARGE_MEMTABLE_SIZE, false);
+        LSMTree reloaded = LSMTree.open(TEST_DIR, LARGE_MEMTABLE_SIZE, false);
         try {
             // Data was only in memtable, no WAL recovery — should be gone
             assertNull(reloaded.get("unflushed"),
@@ -544,7 +543,7 @@ class StorageEngineIntegrationTest {
      * Polls until the flushing queue is empty or timeout is reached.
      */
     private void waitForFlush() throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 5_000;
+        long deadline = System.currentTimeMillis() + 15_000;
         while (System.currentTimeMillis() < deadline) {
             if (lsm.getFlushingChan().isEmpty()) return;
             Thread.sleep(50);

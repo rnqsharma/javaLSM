@@ -101,8 +101,6 @@ public final class BloomFilter {
         ByteBuffer buffer = ByteBuffer.allocate(Long.BYTES + bitset.length)
                 .order(ByteOrder.LITTLE_ENDIAN);
         buffer.putLong(size);
-
-        buffer.putLong(size);
         for (boolean b : bitset) {
             buffer.put(b ? (byte) 1 : (byte) 0);
         }

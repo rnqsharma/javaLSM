@@ -44,7 +44,7 @@ public class LSMTree {
     private final AtomicLong currentSSTSequence = new AtomicLong(0);
 
     private final List<Memtable> flushingQueue = new ArrayList<>();
-    private final BlockingQueue<Memtable> flushingChan = new LinkedBlockingQueue<>(100);
+    private final BlockingQueue<Memtable> flushingChan = new LinkedBlockingQueue<>(1000);
     private final ReentrantReadWriteLock flushingQueueMutex = new ReentrantReadWriteLock();
 
     public BlockingQueue<Integer> getCompactionChan() {
@@ -88,6 +88,7 @@ public class LSMTree {
         );
 
         LSMTree lsm = new LSMTree(directory, maxMemtableSize, wal);
+        lsm.closed = false;
         lsm.inRecovery = recoverFromWAL;
 
         lsm.loadSSTables();
@@ -100,13 +101,36 @@ public class LSMTree {
     }
 
     public void close() throws IOException {
+        mutex.writeLock().lock();
+        flushingQueueMutex.writeLock().lock();
+
+        try {
+            flushingQueue.add(memtable);
+        }  finally {
+            flushingQueueMutex.writeLock().unlock();
+        }
+
+        try {
+            flushingChan.put(memtable);
+
+            memtable = new Memtable();
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        } finally {
+            mutex.writeLock().unlock();
+        }
+
         closed = true;
         executor.shutdown();
         try {
-            executor.awaitTermination(10, TimeUnit.SECONDS);
+            executor.awaitTermination(30, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+
+        wal.close();
+        flushingChan.clear();
+        compactionChan.clear();
 
         // Close all open SSTable file handles
         for (Levels level : levels) {
@@ -115,7 +139,6 @@ public class LSMTree {
             }
         }
 
-        wal.close();
     }
 
     public void put(String key, byte[] value) {
@@ -332,7 +355,7 @@ public class LSMTree {
     private void backgroundMemtableFlushing() {
         try {
             while(true) {
-                Memtable memtable = flushingChan.poll(50, TimeUnit.MILLISECONDS);
+                Memtable memtable = flushingChan.poll(100, TimeUnit.MILLISECONDS);
                 if(memtable != null) {
                     flushMemtable(memtable);
                 } else if (closed) {
