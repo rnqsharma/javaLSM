@@ -5,9 +5,9 @@ import org.db.dto.Command;
 import java.nio.file.Path;
 
 // TODO: Implement WAL
-public class WriteAheadLog {
+public class WriteAheadLog implements WriteAheadLogger {
 
-    record WALEntry(
+    public record WALEntry(
             String key, byte[] value, Command command, long timestamp
     ) {}
     public WriteAheadLog() {}
