@@ -93,7 +93,7 @@ public final class SSTable {
 
     private Optional<LSMEntry> scanFromOffset(String key, long offset) {
         try {
-            fileChannel.position(offset);
+            fileChannel.position(dataOffset + offset);
             while(fileChannel.position() < fileChannel.size()) {
                 long entrySize = readInt64LE(fileChannel);
 
@@ -107,7 +107,7 @@ public final class SSTable {
                     return Optional.of(entry);
                 }
 
-                if(cmp < 0) {
+                if(cmp > 0) {
                     return Optional.empty();
                 }
             }
@@ -126,17 +126,21 @@ public final class SSTable {
         // ── Phase 2: write to disk ─────────────────────────────────────────────
         // Mirrors Go's writeSSTable()
         long dataOffset = writeSSTableFile(directory, result);
+        System.out.println("Data offset: " + dataOffset);
 
         // ── Phase 3: open file handle and return SSTable ───────────────────────
         // Mirrors Go's:
         // file, err := os.Open(filename)
         // return &SSTable{bloomFilter: bloomFilter, index: index, file: file, dataOffset: dataOffset}
         FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ);
+        System.out.println("Opened file channel for : " + directory.getFileName());
         return new SSTable(directory, channel, result.bloomFilter(), result.indexEntries(), dataOffset);
     }
 
     private static long writeSSTableFile(Path directory, MetadataAndBuffer result) throws IOException {
+        System.out.println("Inside writeSSTableFile");
         byte[] bloomFilterData = result.bloomFilter().serialize();
+        System.out.println("Bloom filter data: " + bloomFilterData.length + " serialised");
         byte[] indexData = serialiseIndex(result.indexEntries());
 
         try (FileChannel fc = FileChannel.open(
@@ -170,6 +174,7 @@ public final class SSTable {
 
             // fsync — ensure data is on disk before returning
             fc.force(true);
+            System.out.println("Wrote to SSTable");
 
             return dataOffset;
         }
@@ -229,7 +234,9 @@ public final class SSTable {
         ByteBuffer buf = ByteBuffer.allocate(Long.BYTES).order(ByteOrder.LITTLE_ENDIAN);
         buf.putLong(v);
         buf.flip();
-        fc.write(buf);
+        while (buf.hasRemaining()) {
+            fc.write(buf);
+        }
         return Long.BYTES;  // TODO: Why??
     }
 
@@ -256,17 +263,16 @@ public final class SSTable {
         // Must match unmarshall() read order exactly
         switch (kv) {
             case LSMEntry.Put(String key, byte[] value, long timestamp) when value != null -> {
+                writeLongLE(writer, timestamp);
                 writer.writeByte(0);                            // command = PUT
                 writeStringLE(writer, key);                     // key
                 writeInt32LE(writer, value.length);             // value length
-                writeLongLE(writer, timestamp);
                 writer.write(value);                            // value bytes
             }
             case LSMEntry.Tombstone(String key, long timestamp) -> {
-                writeLongLE(writer, System.nanoTime());         // timestamp
+                writeLongLE(writer, timestamp);                 // timestamp
                 writer.writeByte(1);                            // command = DELETE
                 writeStringLE(writer, key);                     // key
-                writeLongLE(writer, timestamp);
                 // no value for tombstone
             }
             default -> throw new IllegalStateException("Unexpected value: " + kv);

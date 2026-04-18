@@ -39,7 +39,6 @@ public class LSMTree {
     private final WriteAheadLog wal;
     private volatile boolean inRecovery;
     private final Levels[] levels;
-//    private volatile long currentSSTSequence;
 
     private final AtomicLong currentSSTSequence = new AtomicLong(0);
 
@@ -58,9 +57,9 @@ public class LSMTree {
     // Channels → bounded blocking queues
     private final BlockingQueue<Integer> compactionChan = new LinkedBlockingQueue<>(100);
 
-    private final ExecutorService executor;
-
     private volatile boolean closed;
+
+    private final CountDownLatch backgroundThreadLatch; // one per background thread
 
     private LSMTree(Path directory, long maxMemtableSize, WriteAheadLog wal) {
         this.directory = directory;
@@ -73,7 +72,7 @@ public class LSMTree {
         Arrays.setAll(levels, i -> new Levels());
 
         // Similar to goroutines
-        this.executor = Executors.newVirtualThreadPerTaskExecutor();
+        backgroundThreadLatch = new CountDownLatch(2);
 
         System.out.println("Creating LSMTree with maxMemtableSize " + maxMemtableSize);
     }
@@ -94,13 +93,42 @@ public class LSMTree {
         lsm.loadSSTables();
 
         // Start background virtual threads → Similar to starting goroutines
-        lsm.executor.submit(lsm::backgroundCompaction);
-        lsm.executor.submit(lsm::backgroundMemtableFlushing);
+
+        Thread.ofVirtual()
+                .name("compaction")
+                .start(() -> {
+                    try {
+                        lsm.backgroundCompaction();
+                    } catch (Exception e) {
+                        System.err.println("compaction died with: " + e.getMessage());
+                    } finally {
+                        System.out.println("compaction exiting, countDown");
+                        lsm.backgroundThreadLatch.countDown();
+                    }
+                });
+
+        Thread.ofVirtual()
+                .name("memtable-flusher")
+                .start(() -> {
+                    System.out.println("memtable-flusher lambda started");
+                    try {
+                        lsm.backgroundMemtableFlushing();
+                    } catch (Exception e) {
+                        System.err.println("memtable-flusher died with: " + e.getMessage());
+                    } finally {
+                        System.out.println("memtable-flusher exiting, countDown");
+                        lsm.backgroundThreadLatch.countDown();
+                    }
+                });
+
+        System.out.println("memtable-flusher thread submitted");
 
         return lsm;
     }
 
     public void close() throws IOException {
+        System.out.println("close() called");
+
         mutex.writeLock().lock();
         flushingQueueMutex.writeLock().lock();
 
@@ -111,20 +139,50 @@ public class LSMTree {
         }
 
         try {
-            flushingChan.put(memtable);
+            System.out.println("close() offering memtable to flushingChan, size: "
+                    + flushingChan.size());
 
+            boolean offered = flushingChan.offer(memtable, 5, TimeUnit.SECONDS);
+
+            if (!offered) {
+                System.err.println("close() could not enqueue final memtable — channel full");
+            }
             memtable = new Memtable();
         } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             throw new RuntimeException(e);
         } finally {
             mutex.writeLock().unlock();
         }
 
+        System.out.println("Waiting for flushingChan to drain, size: "
+                + flushingChan.size());
+
+        long drainDeadline = System.currentTimeMillis() + 30_000;
+        while (!flushingChan.isEmpty() && System.currentTimeMillis() < drainDeadline) {
+            try {
+                Thread.sleep(50);
+                System.out.println("Waiting... flushingChan.size()=" + flushingChan.size()
+                        + " flushingQueue.size()=" + flushingQueue.size());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+
+        System.out.println("flushingChan drained, setting closed=true");
+        System.out.println("Marking closed as true");
         closed = true;
-        executor.shutdown();
         try {
-            executor.awaitTermination(30, TimeUnit.SECONDS);
+            boolean completed = backgroundThreadLatch.await(30, TimeUnit.SECONDS);
+            System.out.println("close() latch completed: " + completed);
+            if (!completed) {
+                System.err.println(
+                        "LSMTree.close() — virtual threads did not complete within 30s"
+                );
+            }
         } catch (InterruptedException e) {
+            // Mirrors Go's behaviour — restore interrupt flag and continue closing
             Thread.currentThread().interrupt();
         }
 
@@ -142,7 +200,6 @@ public class LSMTree {
     }
 
     public void put(String key, byte[] value) {
-        System.out.println("Putting key " + key + " with value " + value);
         this.mutex.writeLock().lock();
         try {
             if(!inRecovery) {
@@ -152,15 +209,32 @@ public class LSMTree {
             memtable.put(key, value);
 
             if(memtable.sizeInBytes() > maxMemtableSize) {
-                flushingQueueMutex.writeLock().lock();
-                flushingQueue.add(memtable);
-                flushingQueueMutex.writeLock().unlock();
-
-                flushingChan.offer(memtable);
+                Memtable fullMemtable = memtable;
                 memtable = new Memtable();
+                System.out.println("Memtable: " + fullMemtable.getEntries());
+
+                flushingQueueMutex.writeLock().lock();
+                try {
+                    flushingQueue.add(fullMemtable);
+                } finally {
+                    flushingQueueMutex.writeLock().unlock();
+                }
+
+                mutex.writeLock().unlock();         // release write lock before blocking put()
+
+                try {
+                    flushingChan.put(fullMemtable); // blocking — guaranteed to enqueue
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
+
+            System.out.println("FlusingQueue size: " + flushingQueue.size());
+            System.out.println("FlusingChan size: " + flushingChan.size());
         } finally {
-            mutex.writeLock().unlock();
+            if(mutex.isWriteLocked()) {
+                mutex.writeLock().unlock();
+            }
         }
     }
 
@@ -292,54 +366,86 @@ public class LSMTree {
 
     private void backgroundCompaction() {
         try {
-            while(!closed) {
-                Integer candidate = compactionChan.poll(50, TimeUnit.MILLISECONDS);
-                if(candidate != null) {
+            while (true) {
+                Integer candidate = compactionChan.poll(100, TimeUnit.MILLISECONDS);
+                if (candidate != null) {
                     compactLevel(candidate);
                 } else if (closed) {
-                    closed = checkAndTriggerCompaction();
+                    if (compactionChan.isEmpty()) {
+                        return;
+                    }
                 }
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new RuntimeException(e);
         }
     }
 
     private void compactLevel(int level) {
-        if(level >= MAX_LEVELS - 1) {
-            return;
-        }
+        if (level >= MAX_LEVELS - 1) return;
 
-        Levels srcLevel = levels[level];
+        Levels srcLevel  = levels[level];
+        Levels destLevel = levels[level + 1];
+
+        // ── Phase 1: read lock to collect handles ─────────────────────────────
         srcLevel.getMutex().readLock().lock();
+        destLevel.getMutex().readLock().lock();
 
-        List<SSTable>           handles;
-        List<SSTableIterable>   iterators;
+        List<SSTable>         srcHandles;
+        List<SSTable>         destHandles;
+        List<SSTableIterable> iterators;
+
         try {
-            if(srcLevel.getSsTables().size() < MAX_LEVELS_SSTABLES.get(level)) {
-                return;     // another thread may have already compacted
+            if (srcLevel.getSsTables().size() < MAX_LEVELS_SSTABLES.get(level)) {
+                return; // not enough SSTables to compact
             }
-            var pair = getSSTableHandlesAtLevel(level);
-            handles = pair.sstables;
-            iterators = pair.iterators;
+
+            var srcPair  = getSSTableHandlesAtLevel(level);
+            var destPair = getSSTableHandlesAtLevel(level + 1);
+
+            srcHandles  = srcPair.sstables();
+            destHandles = destPair.sstables();
+
+            iterators = new ArrayList<>();
+            iterators.addAll(srcPair.iterators());
+            iterators.addAll(destPair.iterators());
+
         } finally {
-            // We can release the lock on the level now while we process the SSTables. This
-            // is safe because these SSTables are immutable, and can only be deleted by
-            // this function (which is single-threaded).
+            // ALWAYS release read locks before acquiring write locks
+            // ReentrantReadWriteLock does not support lock upgrading — deadlock otherwise
+            destLevel.getMutex().readLock().unlock();
             srcLevel.getMutex().readLock().unlock();
         }
 
+        // ── Phase 2: merge outside of any lock ────────────────────────────────
+        // SSTables are immutable — safe to read without a lock
+        // This is the expensive CPU/IO work — we do not want locks held here
         SSTable mergedSSTable = mergeSSTables(iterators, level + 1);
 
+        // ── Phase 3: write lock to commit the result ──────────────────────────
         srcLevel.getMutex().writeLock().lock();
-        levels[level + 1].getMutex().writeLock().lock();
-
+        destLevel.getMutex().writeLock().lock();
         try {
-            deleteSSTablesAtLevel(level, handles);
+            // Revalidate — another thread may have compacted while we were merging
+            // If srcHandles are no longer in srcLevel, our merge is stale — skip
+            if (!srcLevel.getSsTables().containsAll(srcHandles)) {
+                System.out.println("compactLevel: stale compaction detected, skipping commit");
+                // Clean up the merged SSTable we just wrote
+                try { Files.deleteIfExists(mergedSSTable.getDirectory()); }
+                catch (IOException ignored) {}
+                mergedSSTable.close();
+                return;
+            }
+
+            deleteSSTablesAtLevel(level, srcHandles);
+            deleteSSTablesAtLevel(level + 1, destHandles);
             addSSTableAtLevel(mergedSSTable, level + 1);
+
+        } catch (IOException e) {
+            throw new RuntimeException("compactLevel commit failed", e);
         } finally {
-            levels[level + 1].getMutex().writeLock().unlock();
+            // Always unlock in reverse order of acquisition
+            destLevel.getMutex().writeLock().unlock();
             srcLevel.getMutex().writeLock().unlock();
         }
     }
@@ -353,40 +459,97 @@ public class LSMTree {
     }
 
     private void backgroundMemtableFlushing() {
+        System.out.println("backgroundMemtableFlushing started on: "
+                + Thread.currentThread().getName());
         try {
-            while(true) {
+            while (true) {
                 Memtable memtable = flushingChan.poll(100, TimeUnit.MILLISECONDS);
-                if(memtable != null) {
-                    flushMemtable(memtable);
-                } else if (closed) {
-                    if(flushingChan.isEmpty()) {
+
+                if (memtable != null) {
+                    System.out.println("Polled memtable: " + memtable.getEntries());
+                    System.out.println("Size of flushingChan after polling: " + flushingChan.size());
+                    try {
+                        flushMemtable(memtable);
+                    } catch (Exception e) {
+                        System.err.println("flushMemtable failed: " + e.getMessage());
+                        e.printStackTrace();
+                    }
+                } else {
+                    // flushingChan is empty — check flushingQueue for orphaned memtables
+                    // These are memtables that were added to flushingQueue but
+                    // could not be offered to flushingChan because it was full
+                    flushingQueueMutex.readLock().lock();
+                    Memtable orphaned = null;
+                    try {
+                        if (!flushingQueue.isEmpty()) {
+                            orphaned = flushingQueue.getFirst();
+                        }
+                    } finally {
+                        flushingQueueMutex.readLock().unlock();
+                    }
+
+                    if (orphaned != null) {
+                        System.out.println("Found orphaned memtable in flushingQueue, flushing directly");
+                        try {
+                            flushMemtable(orphaned);
+                        } catch (Exception e) {
+                            System.err.println("Orphaned flushMemtable failed: " + e.getMessage());
+                            e.printStackTrace();
+                        }
+                    } else if (closed) {
+                        System.out.println("closed=true and queues empty, exiting");
                         return;
                     }
                 }
             }
         } catch (InterruptedException e) {
+            System.out.println("backgroundMemtableFlushing interrupted");
             Thread.currentThread().interrupt();
         }
     }
 
     public void flushMemtable (Memtable memtable) {
         if(memtable.sizeInBytes() == 0) {
+            System.out.println("Memtable is empty");
+
+            // Still remove from flushingQueue so it does not accumulate
+            flushingQueueMutex.writeLock().lock();
+            try {
+                if (!flushingQueue.isEmpty()) {
+                    flushingQueue.removeFirst();
+                }
+            } finally {
+                flushingQueueMutex.writeLock().unlock();
+            }
             return;
         }
 
-        currentSSTSequence.incrementAndGet();
+        long sequence = currentSSTSequence.incrementAndGet();
+        Path path = getSSTableFilename(0, sequence);
 
-        Path path = getSSTableFilename(0);
+        List<LSMEntry> entries = memtable.getEntries();
+
+        System.out.println("Flushing memtable to: " + path.getFileName());
+        System.out.println("Entry count: " + entries.size());
+        System.out.println("First key: " + (entries.isEmpty() ? "none"
+                : entries.getFirst().key()));
+        System.out.println("Last key:  " + (entries.isEmpty() ? "none"
+                : entries.getLast().key()));
 
         SSTable sst;
         try {
-            sst = SSTable.write(path, memtable.getEntries());
+            System.out.println("Writing memtable to disk for sequence number " + currentSSTSequence.get());
+            sst = SSTable.write(path, entries);
+            System.out.println("Wrote memtable to SSTable: " + sst.getDirectory().getFileName());
         } catch (IOException e) {
             throw new RuntimeException("Failed to flush memtable to SSTable: " + path.getFileName().toString(), e);
         }
 
+        System.out.println("Trying to get the lock");
         levels[0].getMutex().writeLock().lock();
+        System.out.println("Lock for level acquired");
         flushingQueueMutex.writeLock().lock();
+        System.out.println("Lock Acquired");
 
         try {
             wal.createCheckPoint(new WriteAheadLog.WALEntry(
@@ -399,26 +562,41 @@ public class LSMTree {
             levels[0].getSsTables().add(sst);
 
             if(!flushingQueue.isEmpty()) {
-                flushingQueue.removeFirst();
+                System.out.println("Removing flushed memtable");
+                Memtable removedMemtable = flushingQueue.removeFirst();
+                System.out.println("Removed flushed memtable: " + removedMemtable.getEntries());
             }
-        } finally {
+        } catch (Exception e) {
+            System.err.println("Removing flushMemtable failed: " + e.getMessage());
+        }
+        finally {
+            System.out.println("Releasing lockkk");
             flushingQueueMutex.writeLock().unlock();
+            System.out.println("Releasing level acquired");
             levels[0].getMutex().writeLock().unlock();
+            System.out.println("Level Released");
         }
 
         // Always signals compaction after a flush — no capacity check
         // Unlike our earlier offer(), this mirrors Go's blocking send
         // Use put() to block if queue is full, matching Go's blocking channel send
         try {
-            compactionChan.put(0);
+            System.out.println("Signalling compactionChan");
+            boolean signalled = compactionChan.offer(0, 1, TimeUnit.SECONDS);
+            System.out.println("Signalled compactionChan");
+            if (!signalled) {
+                System.err.println("compactionChan full — compaction thread may be stuck");
+            }
         } catch (InterruptedException e) {
+            System.err.println("Exception in flushMemtable");
             Thread.currentThread().interrupt();
         }
     }
 
     private SSTable mergeSSTables(List<SSTableIterable> iterators, int targetLevel) {
         List<LSMEntry> mergedEntries = mergeIterators(iterators);
-        Path path = getSSTableFilename(targetLevel);
+        long sequence = currentSSTSequence.incrementAndGet();
+        Path path = getSSTableFilename(targetLevel, sequence);
         try {
             return SSTable.write(path, mergedEntries);
         } catch (IOException e) {
@@ -499,9 +677,9 @@ public class LSMTree {
         return readyToExit;
     }
 
-    private Path getSSTableFilename(int targetLevel) {
+    private Path getSSTableFilename(int targetLevel, long sequence) {
         return directory.resolve(
-                "%s%d_%d".formatted(SSTABLE_PREFIX, targetLevel, currentSSTSequence.get())
+                "%s%d_%d".formatted(SSTABLE_PREFIX, targetLevel, sequence)
         );
     }
 
@@ -515,7 +693,10 @@ public class LSMTree {
 
     private void addSSTableAtLevel(SSTable mergedSSTable, int levelIdx) {
         levels[levelIdx].getSsTables().add(mergedSSTable);
-        compactionChan.offer(levelIdx);
+        if (levelIdx < MAX_LEVELS - 1 &&
+                levels[levelIdx].getSsTables().size() > MAX_LEVELS_SSTABLES.get(levelIdx)) {
+            compactionChan.offer(levelIdx);
+        }
     }
 
     private byte[] handleValue(LSMEntry entry) {
