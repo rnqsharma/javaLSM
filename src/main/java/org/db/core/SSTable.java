@@ -56,6 +56,10 @@ public final class SSTable {
         fileChannel.close();
     }
 
+    public long getDataOffset() {
+        return dataOffset;
+    }
+
     public Optional<LSMEntry> get(String key) {
         if(!bloomFilter.mightContain(key)) {
             return Optional.empty();
@@ -93,11 +97,11 @@ public final class SSTable {
 
     private Optional<LSMEntry> scanFromOffset(String key, long offset) {
         try {
-            fileChannel.position(offset);
-            while(fileChannel.position() < fileChannel.size()) {
-                long entrySize = readInt64LE(fileChannel);
+            long position = dataOffset + offset;
+            while(position < fileChannel.size()) {
+                long entrySize = readInt64LE(fileChannel, position);
 
-                byte[] data = readBytes(fileChannel, entrySize);
+                byte[] data = readBytes(fileChannel, position, entrySize);
 
                 LSMEntry entry = SSTableIterable.unmarshall(data);
 
@@ -107,7 +111,7 @@ public final class SSTable {
                     return Optional.of(entry);
                 }
 
-                if(cmp < 0) {
+                if(cmp > 0) {
                     return Optional.empty();
                 }
             }
@@ -120,17 +124,12 @@ public final class SSTable {
 
     public static SSTable write(Path directory, List<LSMEntry> entries) throws IOException {
         // ── Phase 1: build metadata and entries buffer ─────────────────────────
-        // Mirrors Go's buildMetadataAndEntriesBuffer()
         var result = buildMetadataAndEntriesBuffer(entries);
 
         // ── Phase 2: write to disk ─────────────────────────────────────────────
-        // Mirrors Go's writeSSTable()
         long dataOffset = writeSSTableFile(directory, result);
 
         // ── Phase 3: open file handle and return SSTable ───────────────────────
-        // Mirrors Go's:
-        // file, err := os.Open(filename)
-        // return &SSTable{bloomFilter: bloomFilter, index: index, file: file, dataOffset: dataOffset}
         FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ);
         return new SSTable(directory, channel, result.bloomFilter(), result.indexEntries(), dataOffset);
     }
@@ -147,29 +146,23 @@ public final class SSTable {
             long dataOffset = 0;
 
             // ── Write bloom filter size (int64 LE) ────────────────────────────
-            // Mirrors Go's:
-            // binary.Write(file, binary.LittleEndian, EntrySize(len(bloomFilterData)))
             dataOffset += writeInt64LEToChannel(fc, bloomFilterData.length);
 
             // ── Write bloom filter data ───────────────────────────────────────
-            // Mirrors Go's: file.Write(bloomFilterData)
             dataOffset += writeToChannel(fc, bloomFilterData);
 
             // ── Write index size (int64 LE) ───────────────────────────────────
-            // Mirrors Go's:
-            // binary.Write(file, binary.LittleEndian, EntrySize(len(indexData)))
             dataOffset += writeInt64LEToChannel(fc, indexData.length);
 
             // ── Write index data ──────────────────────────────────────────────
-            // Mirrors Go's: file.Write(indexData)
             dataOffset += writeToChannel(fc, indexData);
 
             // ── Write entries ─────────────────────────────────────────────────
-            // Mirrors Go's: io.Copy(file, entriesBuffer)
             writeToChannel(fc, result.entriesBuffer());
 
             // fsync — ensure data is on disk before returning
             fc.force(true);
+            System.out.println("Wrote to SSTable");
 
             return dataOffset;
         }
@@ -229,7 +222,9 @@ public final class SSTable {
         ByteBuffer buf = ByteBuffer.allocate(Long.BYTES).order(ByteOrder.LITTLE_ENDIAN);
         buf.putLong(v);
         buf.flip();
-        fc.write(buf);
+        while (buf.hasRemaining()) {
+            fc.write(buf);
+        }
         return Long.BYTES;  // TODO: Why??
     }
 
@@ -256,17 +251,16 @@ public final class SSTable {
         // Must match unmarshall() read order exactly
         switch (kv) {
             case LSMEntry.Put(String key, byte[] value, long timestamp) when value != null -> {
+                writeLongLE(writer, timestamp);
                 writer.writeByte(0);                            // command = PUT
                 writeStringLE(writer, key);                     // key
                 writeInt32LE(writer, value.length);             // value length
-                writeLongLE(writer, timestamp);
                 writer.write(value);                            // value bytes
             }
             case LSMEntry.Tombstone(String key, long timestamp) -> {
-                writeLongLE(writer, System.nanoTime());         // timestamp
+                writeLongLE(writer, timestamp);                 // timestamp
                 writer.writeByte(1);                            // command = DELETE
                 writeStringLE(writer, key);                     // key
-                writeLongLE(writer, timestamp);
                 // no value for tombstone
             }
             default -> throw new IllegalStateException("Unexpected value: " + kv);
@@ -360,8 +354,8 @@ public final class SSTable {
     // ── Binary read helpers ───────────────────────────────────────────────────────
 
     /**
-     * Reads exactly 8 bytes from the channel and returns them as a long.
-     * Mirrors Go's readDataSize(file) which uses binary.Read with LittleEndian.
+     * Sequential read — advances fc.position().
+     * Only safe when called from a single thread (e.g. SSTable.open).
      */
     private static long readInt64LE(FileChannel channel) throws IOException {
         ByteBuffer buf = ByteBuffer
@@ -370,8 +364,42 @@ public final class SSTable {
 
         while (buf.hasRemaining()) {
             if (channel.read(buf) == -1) {
+                throw new IOException("Unexpected EOF reading int64");
+            }
+        }
+        buf.flip();
+        return buf.getLong();
+    }
+
+    private static byte[] readBytes(FileChannel channel, long size) throws IOException {
+        if (size > Integer.MAX_VALUE || size < 0) {
+            throw new IllegalArgumentException("Invalid size: " + size);
+        }
+        byte[]     data = new byte[(int) size];
+        ByteBuffer buf  = ByteBuffer.wrap(data);
+        while (buf.hasRemaining()) {
+            if (channel.read(buf) == -1) {
+                throw new IOException("Unexpected EOF reading bytes, expected: " + size);
+            }
+        }
+        return data;
+    }
+
+    /**
+     * Reads exactly 8 bytes from the channel and returns them as a long.
+     */
+    private static long readInt64LE(FileChannel channel, long position) throws IOException {
+        ByteBuffer buf = ByteBuffer
+                .allocate(Long.BYTES)
+                .order(ByteOrder.LITTLE_ENDIAN);
+
+        long pos = position;
+        while (buf.hasRemaining()) {
+            int bytesRead = channel.read(buf, pos);
+            if (bytesRead == -1) {
                 throw new IOException("Unexpected EOF while reading size prefix");
             }
+            pos += bytesRead;
         }
 
         buf.flip();
@@ -382,7 +410,7 @@ public final class SSTable {
      * Reads exactly `size` bytes from the channel.
      * Mirrors Go's: make([]byte, size) followed by file.Read(data)
      */
-    private static byte[] readBytes(FileChannel channel, long size) throws IOException {
+    private static byte[] readBytes(FileChannel channel, long position, long size) throws IOException {
         if (size > Integer.MAX_VALUE) {
             throw new IllegalArgumentException(
                     "Section size %d exceeds max Java array capacity".formatted(size)
@@ -391,13 +419,16 @@ public final class SSTable {
 
         byte[]     data = new byte[(int) size];
         ByteBuffer buf  = ByteBuffer.wrap(data);
+        long pos  = position;
 
         while (buf.hasRemaining()) {
-            if (channel.read(buf) == -1) {
+            int bytesRead = channel.read(buf, pos);
+            if (bytesRead == -1) {
                 throw new IOException(
                         "Unexpected EOF — expected %d bytes, got %d".formatted(size, buf.position())
                 );
             }
+            pos += bytesRead;
         }
 
         return data;
