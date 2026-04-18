@@ -1,6 +1,5 @@
 import org.db.core.LSMTree;
 import org.junit.jupiter.api.*;
-import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -187,7 +186,7 @@ class StorageEngineIntegrationTest {
     @DisplayName("Data survives SSTable reload after close")
     void testSSTableReload() throws IOException, InterruptedException {
         // Use small memtable to force flush to SSTable
-//        lsm.close();
+        lsm.close();
         lsm = LSMTree.open(TEST_DIR, SMALL_MEMTABLE_SIZE, false);
 
         // Write enough data to trigger flush
@@ -378,7 +377,6 @@ class StorageEngineIntegrationTest {
         CountDownLatch  latch    = new CountDownLatch(1);
         List<Throwable> errors   = new ArrayList<>();
 
-        // Half threads write, half threads read
         for (int t = 0; t < threadCount; t++) {
             final int threadId = t;
             executor.submit(() -> {

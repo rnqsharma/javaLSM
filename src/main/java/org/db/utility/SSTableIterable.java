@@ -2,6 +2,7 @@ package org.db.utility;
 
 import org.db.core.SSTable;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -10,21 +11,24 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
-public class SSTableIterable {
+public class SSTableIterable implements Closeable {
 
     private final SSTable ssTable;
     private final Path path;
     private LSMEntry entry;
     private final FileChannel channel;
+    private boolean exhausted;
 
-    public SSTableIterable(SSTable ssTable, Path path, LSMEntry entry) {
+    public SSTableIterable(SSTable ssTable, Path path) throws IOException {
         this.ssTable = ssTable;
         this.path = path;
-        this.entry = entry;
+        this.exhausted = false;
 
         // Initializing FileChannel to avoid reopening and bad reads
-        try (FileChannel fc = FileChannel.open(path, StandardOpenOption.READ)) {
-            this.channel = fc;
+        this.channel  = FileChannel.open(path, StandardOpenOption.READ);
+
+        try {
+            this.channel.position(ssTable.getDataOffset());
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
@@ -47,10 +51,14 @@ public class SSTableIterable {
     }
 
     public boolean hasNext() {
-        return channel.isOpen() && channelHasRemainingBytes();
+        return channel.isOpen() && !exhausted && channelHasRemainingBytes();
     }
 
     public SSTableIterable next() {
+        if(!hasNext()) {
+            exhausted = true;
+            return this;
+        }
         try {
             long size = readDataSize(this.channel);
             byte[] data = readEntryDataFromFile(this.channel, size);
@@ -58,6 +66,7 @@ public class SSTableIterable {
 
             return this;
         } catch (IOException e) {
+            exhausted = true;
             e.printStackTrace();
             throw new RuntimeException(e);
         }
@@ -141,6 +150,13 @@ public class SSTableIterable {
             return channel.position() < channel.size();
         } catch (IOException e) {
             return false;
+        }
+    }
+
+    @Override
+    public void close() throws IOException {
+        if (channel != null && channel.isOpen()) {
+            channel.close();
         }
     }
 }
