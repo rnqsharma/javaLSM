@@ -1,4 +1,4 @@
-package org.db.utility;
+package org.db.dto;
 
 public sealed interface LSMEntry permits LSMEntry.Put, LSMEntry.Tombstone {
 

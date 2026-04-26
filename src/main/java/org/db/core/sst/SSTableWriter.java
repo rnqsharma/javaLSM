@@ -2,15 +2,17 @@ package org.db.core.sst;
 
 import org.db.core.BloomFilter;
 import org.db.io.ChannelIO;
-import org.db.io.EntrySerializer;
+import org.db.io.LSMEntrySerializer;
 import org.db.io.IndexSerializer;
 import org.db.dto.IndexEntry;
 import org.db.dto.MetadataAndBuffer;
-import org.db.utility.LSMEntry;
+import org.db.dto.LSMEntry;
 
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -26,7 +28,7 @@ public final class SSTableWriter {
         var built = buildBuffers(entries);
 
         byte[] bloomData = built.bloomFilter().serialize();
-        byte[] indexData = IndexSerializer.serialise(built.indexEntries());
+        byte[] indexData = IndexSerializer.INSTANCE.marshall(built.indexEntries());
 
         long dataOffset = writeToDisk(path, bloomData, indexData, built.entriesBuffer());
 
@@ -48,13 +50,13 @@ public final class SSTableWriter {
         long currentOffset = 0;
 
         for (LSMEntry entry : entries) {
-            byte[] data      = EntrySerializer.marshall(entry);
+            byte[] data      = LSMEntrySerializer.INSTANCE.marshall(entry);
             long   entrySize = data.length;
 
             indexEntries.add(new IndexEntry(entry.key(), currentOffset));
             bloomFilter.add(entry.key());
 
-            EntrySerializer.writeLongLE(writer, entrySize); // size prefix
+            writeLongLE(writer, entrySize); // size prefix
             writer.write(data);
 
             currentOffset += Long.BYTES + entrySize;
@@ -63,6 +65,12 @@ public final class SSTableWriter {
         writer.flush();
         return new MetadataAndBuffer(bloomFilter, indexEntries,
                                      entriesBuffer.toByteArray());
+    }
+
+    private static void writeLongLE(DataOutputStream w, long v) throws IOException {
+        ByteBuffer buf = ByteBuffer.allocate(Long.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+        buf.putLong(v);
+        w.write(buf.array());
     }
 
     private static long writeToDisk(Path path, byte[] bloomData,
