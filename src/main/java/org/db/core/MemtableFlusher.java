@@ -1,9 +1,11 @@
 package org.db.core;
 
 import org.db.core.sst.SSTable;
+import org.db.core.wal.WALEntry;
+import org.db.core.wal.WriteAheadLogger;
 import org.db.dto.Command;
 import org.db.dto.Levels;
-import org.db.utility.LSMEntry;
+import org.db.dto.LSMEntry;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -76,7 +78,7 @@ public final class MemtableFlusher {
         levels[0].getMutex().writeLock().lock();
         flushingQueueMutex.writeLock().lock();
         try {
-            wal.createCheckPoint(new WriteAheadLog.WALEntry(
+            wal.createCheckPoint(new WALEntry(
                     path.getFileName().toString(),
                     null,
                     Command.WRITE_SST,

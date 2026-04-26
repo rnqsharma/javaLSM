@@ -1,6 +1,6 @@
-package org.db.utility;
+package org.db.core.sst;
 
-import org.db.core.sst.SSTable;
+import org.db.dto.LSMEntry;
 
 import java.io.Closeable;
 import java.io.IOException;

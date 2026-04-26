@@ -2,8 +2,8 @@ package org.db.core;
 
 import org.db.core.sst.SSTable;
 import org.db.dto.Levels;
-import org.db.utility.LSMEntry;
-import org.db.utility.SSTableIterable;
+import org.db.dto.LSMEntry;
+import org.db.core.sst.SSTableIterable;
 
 import java.io.IOException;
 import java.nio.file.Files;

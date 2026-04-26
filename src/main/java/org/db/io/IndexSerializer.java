@@ -8,12 +8,14 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
-public final class IndexSerializer {
+public final class IndexSerializer implements EntrySerializer<List<IndexEntry>> {
 
+    public static final IndexSerializer INSTANCE = new IndexSerializer();
     private IndexSerializer() {
     }
 
-    public static byte[] serialise(List<IndexEntry> entries) {
+    @Override
+    public byte[] marshall(List<IndexEntry> entries) {
         int totalSize = Integer.BYTES;
         for (IndexEntry entry : entries) {
             totalSize += Integer.BYTES
@@ -36,7 +38,8 @@ public final class IndexSerializer {
         return buf.array();
     }
 
-    public static List<IndexEntry> deserialise(byte[] data) {
+    @Override
+    public List<IndexEntry> unmarshall(byte[] data) {
         ByteBuffer buf = ByteBuffer
                 .wrap(data)
                 .order(ByteOrder.LITTLE_ENDIAN);

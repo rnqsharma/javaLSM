@@ -2,9 +2,11 @@ package org.db.core;
 
 import org.db.core.sst.SSTable;
 import org.db.core.sst.SSTableLoader;
-import org.db.dto.Command;
+import org.db.core.wal.WALEntry;
+import org.db.core.wal.WriteAheadLog;
+import org.db.core.wal.WriteAheadLogger;
 import org.db.dto.Levels;
-import org.db.utility.LSMEntry;
+import org.db.dto.LSMEntry;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -19,6 +21,9 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+import static org.db.dto.Command.PUT;
+import static org.db.dto.Command.TOMBSTONE;
 
 public final class LSMTree implements Closeable {
 
@@ -123,8 +128,8 @@ public final class LSMTree implements Closeable {
         Memtable fullMemtable = null;
         try {
             if (!inRecovery) {
-                wal.writeEntry(new WriteAheadLog.WALEntry(
-                        key, value, Command.PUT, System.currentTimeMillis()
+                wal.writeEntry(new WALEntry(
+                        key, value, PUT, System.currentTimeMillis()
                 ));
             }
             memtable.put(key, value);
@@ -140,8 +145,8 @@ public final class LSMTree implements Closeable {
         Memtable fullMemtable = null;
         try {
             if (!inRecovery) {
-                wal.writeEntry(new WriteAheadLog.WALEntry(
-                        key, null, Command.TOMBSTONE, System.currentTimeMillis()
+                wal.writeEntry(new WALEntry(
+                        key, null, TOMBSTONE, System.currentTimeMillis()
                 ));
             }
             memtable.delete(key);
@@ -330,9 +335,62 @@ public final class LSMTree implements Closeable {
     }
 
     private void recoverFromWAL() throws IOException {
+        List<WALEntry> entries;
+        try {
+            entries = wal.readAll(true);
+        } catch (IOException e) {
+            throw new IOException("WAL recovery failed — could not read WAL entries", e);
+        }
+
+        if (entries.isEmpty()) {
+            System.out.println("WAL recovery: no entries to replay");
+            inRecovery = false;
+            return;
+        }
+
+        System.out.println("WAL recovery: replaying " + entries.size() + " entries");
+
+        // Set inRecovery=true — prevents put()/delete() from writing to WAL again
         inRecovery = true;
-        // WAL recovery implementation
+        int replayed  = 0;
+        int skipped   = 0;
+
+        for (WALEntry entry : entries) {
+            try {
+                switch (entry.command()) {
+
+                    case PUT -> {
+                        put(entry.key(), entry.value());
+                        replayed++;
+                    }
+
+                    case TOMBSTONE -> {
+                        delete(entry.key());
+                        replayed++;
+                    }
+
+                    // WRITE_SST is a checkpoint marker — not a data operation
+                    // It records that a memtable was flushed to an SSTable
+                    // The data is already on disk — skip it
+                    case WRITE_SST -> {
+                        System.out.println("WAL recovery: skipping WRITE_SST checkpoint for: "
+                                + entry.key());
+                        skipped++;
+                    }
+                }
+            } catch (Exception e) {
+                // Log and continue — a single bad entry should not abort recovery
+                System.err.println("WAL recovery: failed to replay entry key="
+                        + entry.key() + " command=" + entry.command()
+                        + " — " + e.getMessage());
+            }
+        }
+
         inRecovery = false;
+
+        System.out.println("WAL recovery complete — replayed=" + replayed
+                + " skipped=" + skipped
+                + " total=" + entries.size());
     }
 
     public BlockingQueue<Memtable> getFlushingChan() {

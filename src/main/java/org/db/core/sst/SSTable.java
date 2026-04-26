@@ -3,7 +3,7 @@ package org.db.core.sst;
 import org.db.core.BloomFilter;
 import org.db.dto.IndexEntry;
 import org.db.dto.SSTableMetadata;
-import org.db.utility.LSMEntry;
+import org.db.dto.LSMEntry;
 
 import java.io.Closeable;
 import java.io.IOException;

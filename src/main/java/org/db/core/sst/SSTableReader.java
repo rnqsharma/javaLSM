@@ -2,11 +2,11 @@ package org.db.core.sst;
 
 import org.db.core.BloomFilter;
 import org.db.io.ChannelIO;
-import org.db.io.EntrySerializer;
+import org.db.io.LSMEntrySerializer;
 import org.db.io.IndexSerializer;
 import org.db.dto.IndexEntry;
 import org.db.dto.SSTableMetadata;
-import org.db.utility.LSMEntry;
+import org.db.dto.LSMEntry;
 
 import java.io.IOException;
 import java.nio.channels.FileChannel;
@@ -15,25 +15,26 @@ import java.util.Optional;
 
 public final class SSTableReader {
 
-    private SSTableReader() {}
+    private SSTableReader() {
+    }
 
     public static SSTableMetadata readMetadata(FileChannel fc) throws IOException {
         long dataOffset = 0;
 
-        long   bloomSize = ChannelIO.readInt64LE(fc);
+        long bloomSize = ChannelIO.readInt64LE(fc);
         dataOffset += Long.BYTES;
 
         byte[] bloomData = ChannelIO.readBytes(fc, bloomSize);
         dataOffset += bloomData.length;
 
-        long   indexSize = ChannelIO.readInt64LE(fc);
+        long indexSize = ChannelIO.readInt64LE(fc);
         dataOffset += Long.BYTES;
 
         byte[] indexData = ChannelIO.readBytes(fc, indexSize);
         dataOffset += indexData.length;
 
         BloomFilter bloomFilter = BloomFilter.deSerialise(bloomData);
-        List<IndexEntry> index       = IndexSerializer.deserialise(indexData);
+        List<IndexEntry> index = IndexSerializer.INSTANCE.unmarshall(indexData);
 
         return new SSTableMetadata(bloomFilter, index, dataOffset);
     }
@@ -51,9 +52,9 @@ public final class SSTableReader {
                                                     long dataOffset,
                                                     long offset,
                                                     String key) throws IOException {
-        long     pos        = dataOffset + offset;
-        long     fileSize   = fc.size();
-        long[]   sizeResult = new long[1];
+        long pos = dataOffset + offset;
+        long fileSize = fc.size();
+        long[] sizeResult = new long[1];
         byte[][] dataResult = new byte[1][];
 
         while (pos < fileSize) {
@@ -62,18 +63,18 @@ public final class SSTableReader {
 
             if (entrySize <= 0 || entrySize > Integer.MAX_VALUE) {
                 throw new IOException(
-                    "Corrupt entry size: " + entrySize + " at position: "
-                    + (pos - Long.BYTES)
+                        "Corrupt entry size: " + entrySize + " at position: "
+                                + (pos - Long.BYTES)
                 );
             }
 
             pos = ChannelIO.readBytesAt(fc, pos, entrySize, dataResult);
 
-            LSMEntry entry = EntrySerializer.unmarshall(dataResult[0]);
-            int      cmp   = entry.key().compareTo(key);
+            LSMEntry entry = LSMEntrySerializer.INSTANCE.unmarshall(dataResult[0]);
+            int cmp = entry.key().compareTo(key);
 
             if (cmp == 0) return Optional.of(entry);
-            if (cmp > 0)  return Optional.empty(); // past target key
+            if (cmp > 0) return Optional.empty(); // past target key
             // cmp < 0 — keep scanning forward
         }
 

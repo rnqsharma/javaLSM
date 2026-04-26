@@ -1,7 +1,7 @@
 package org.db.core;
 
 import org.db.dto.Command;
-import org.db.utility.LSMEntry;
+import org.db.dto.LSMEntry;
 
 import java.util.ArrayList;
 import java.util.List;
